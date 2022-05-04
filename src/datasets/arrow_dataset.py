@@ -85,13 +85,12 @@ from .table import (
     table_visitor,
 )
 from .tasks import TaskTemplate
-from .utils import logging
 from .utils.file_utils import _retry, estimate_dataset_size
 from .utils.info_utils import is_small_dataset
 from .utils.py_utils import temporary_assignment, unique_values
 from .utils.streaming_download_manager import xgetsize
 from .utils.typing import PathLike
-
+from transformers import logging
 
 if TYPE_CHECKING:
     from .dataset_dict import DatasetDict
@@ -568,11 +567,9 @@ def _check_column_names(column_names: List[str]):
         raise ValueError(f"The table can't have duplicated columns but columns {duplicated_columns} are duplicated.")
 
 
-def _check_valid_indices_value(value, size):
-    if (value < 0 and value + size < 0) or (value >= size):
-        raise IndexError(
-            f"Invalid value {value} in indices iterable. All values must be within range [-{size}, {size - 1}]."
-        )
+def _check_valid_indices_value(index, size):
+    if (index < 0 and index + size < 0) or (index >= size):
+        raise IndexError(f"Index {index} out of range for dataset of size {size}.")
 
 
 def _check_if_features_can_be_aligned(features_list: List[Features]):
@@ -669,9 +666,9 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             )
 
         if self._indices is not None:
-            if not pa.types.is_unsigned_integer(self._indices.column(0)[0].type):
+            if not pa.types.is_unsigned_integer(self._indices.column(0).type):
                 raise ValueError(
-                    f"indices must be an Arrow table of unsigned integers, current type is {self._indices.column(0)[0].type}"
+                    f"indices must be an Arrow table of unsigned integers, current type is {self._indices.column(0).type}"
                 )
         _check_column_names(self._data.column_names)
 
@@ -1890,9 +1887,12 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         if num_proc is not None and num_proc <= 0:
             raise ValueError("num_proc must be an integer > 0.")
 
-        # If the array is empty we do nothing
+        # If the array is empty we do nothing (but we make sure to remove the requested columns anyway)
         if len(self) == 0:
-            return self
+            if remove_columns:
+                return self.remove_columns(remove_columns)
+            else:
+                return self
 
         if function is None:
             function = lambda x: x  # noqa: E731
@@ -2598,8 +2598,9 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         indices = list(indices)
 
         size = len(self)
-        _check_valid_indices_value(int(max(indices)), size=size)
-        _check_valid_indices_value(int(min(indices)), size=size)
+        if indices:
+            _check_valid_indices_value(int(max(indices)), size=size)
+            _check_valid_indices_value(int(min(indices)), size=size)
 
         indices_array = pa.array(indices, type=pa.uint64())
         # Check if we need to convert indices
@@ -3290,7 +3291,8 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         branch: Optional[str] = None,
         shard_size: Optional[int] = 500 << 20,
         embed_external_files: bool = True,
-    ) -> Tuple[str, str, int, int]:
+        starting_index: Optional[int] = 0
+    ) -> Tuple[str, str, int, int, int]:
         """Pushes the dataset to the hub.
         The dataset is pushed using HTTP requests and does not need to have neither git or git-lfs installed.
 
@@ -3439,6 +3441,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         files = [file for file in files if file.startswith("data/")]
 
         def path_in_repo(_index):
+            _index = _index
             return f"data/{split}-{_index:05d}-of-{num_shards:05d}.parquet"
 
         # Only delete file shards that don't currently exist. Others will be overwritten if the content is different
@@ -3449,7 +3452,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
 
             return file_from_same_split and not file_to_overwrite
 
-        file_shards_to_delete = [file for file in files if should_delete_file(file)]
+        file_shards_to_delete = [] 
 
         def delete_file(file):
             api.delete_file(file, repo_id=repo_id, token=token, repo_type="dataset", revision=branch)
@@ -3470,6 +3473,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             total=num_shards,
             disable=not logging.is_progress_bar_enabled(),
         ):
+            logger.info(f"Uploading {path_in_repo(index + starting_index)}")
             buffer = BytesIO()
             shard.to_parquet(buffer)
             uploaded_size += buffer.tell()
@@ -3477,7 +3481,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                 api.upload_file,
                 func_kwargs=dict(
                     path_or_fileobj=buffer.getvalue(),
-                    path_in_repo=path_in_repo(index),
+                    path_in_repo=path_in_repo(index + starting_index),
                     repo_id=repo_id,
                     token=token,
                     repo_type="dataset",
@@ -3485,12 +3489,12 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                     identical_ok=True,
                 ),
                 exceptions=HTTPError,
-                status_codes=[504],
+                status_codes=[504, 502, 500],
                 base_wait_time=2.0,
-                max_retries=5,
-                max_wait_time=20.0,
+                max_retries=300,
+                max_wait_time=600.0,
             )
-        return repo_id, split, uploaded_size, dataset_nbytes
+        return repo_id, split, uploaded_size, dataset_nbytes, num_shards
 
     def push_to_hub(
         self,
@@ -3501,6 +3505,10 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         branch: Optional[str] = None,
         shard_size: Optional[int] = 500 << 20,
         embed_external_files: bool = True,
+        existing_uploaded_size: int = 0,
+        existing_nbytes: int = 0,
+        existing_nshards: int = 0,
+        num_examples: int = 0
     ):
         """Pushes the dataset to the hub.
         The dataset is pushed using HTTP requests and does not need to have neither git or git-lfs installed.
@@ -3537,7 +3545,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         >>> dataset.push_to_hub("<organization>/<dataset_id>", split="evaluation")
         ```
         """
-        repo_id, split, uploaded_size, dataset_nbytes = self._push_parquet_shards_to_hub(
+        repo_id, split, uploaded_size, dataset_nbytes, num_shards = self._push_parquet_shards_to_hub(
             repo_id=repo_id,
             split=split,
             private=private,
@@ -3545,7 +3553,19 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             branch=branch,
             shard_size=shard_size,
             embed_external_files=embed_external_files,
+            starting_index=existing_nshards
         )
+        logger.info(f"Pushed uploaded size = {uploaded_size}")
+        logger.info(f"Pushed dataset_nbytes = {dataset_nbytes}")
+        logger.info(f"Pushed num shards = {num_shards}")
+
+        uploaded_size = uploaded_size + existing_uploaded_size
+        dataset_nbytes = dataset_nbytes + existing_nbytes
+        
+        logger.info(f"Writing to info, total uploaded size = {uploaded_size}")
+        logger.info(f"Writing to info, total nbytes = {dataset_nbytes}")
+        logger.info(f"Writing to info, total num_examples = {num_examples}")
+
         organization, dataset_name = repo_id.split("/")
         info_to_dump = self.info.copy()
         info_to_dump.download_checksums = None
@@ -3553,7 +3573,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         info_to_dump.dataset_size = dataset_nbytes
         info_to_dump.size_in_bytes = uploaded_size + dataset_nbytes
         info_to_dump.splits = {
-            split: SplitInfo(split, num_bytes=dataset_nbytes, num_examples=len(self), dataset_name=dataset_name)
+            split: SplitInfo(split, num_bytes=dataset_nbytes, num_examples=num_examples, dataset_name=dataset_name)
         }
         buffer = BytesIO()
         buffer.write(f'{{"{organization}--{dataset_name}": '.encode())
@@ -3568,6 +3588,8 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             revision=branch,
             identical_ok=True,
         )
+
+        return uploaded_size, dataset_nbytes, num_shards
 
     @transmit_format
     @fingerprint_transform(inplace=False)
@@ -3748,7 +3770,8 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                 The elasticsearch index name used to create the index.
             es_index_config (Optional :obj:`dict`):
                 The configuration of the elasticsearch index.
-                Default config is::
+                Default config is:
+                ```
 
                     {
                         "settings": {
@@ -3765,6 +3788,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                             }
                         },
                     }
+                ```
 
         Example:
 
@@ -4036,3 +4060,5 @@ def get_indices_from_mask_function(
         indices_array = indices_mapping.column(0).take(indices_array)
         indices_array = indices_array.to_pylist()
     return {"indices": indices_array}
+
+
