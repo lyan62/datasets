@@ -869,6 +869,122 @@ class IterableDataset(DatasetInfoMixin):
             shuffling=copy.deepcopy(self._shuffling),
         )
 
+def _concatenate_iterable_datasets(
+    dsets: List[IterableDataset],
+    info: Optional[DatasetInfo] = None,
+    split: Optional[NamedSplit] = None,
+    axis: int = 0,
+) -> IterableDataset:
+    """
+    Converts a list of :class:`IterableDataset` with the same schema into a single :class:`IterableDataset`.
+    Missing data are filled with None values.
+    <Added version="2.4.0"/>
+    Args:
+        dsets (:obj:`List[datasets.IterableDataset]`): List of Datasets to concatenate.
+        info (:class:`DatasetInfo`, optional): Dataset information, like description, citation, etc.
+        split (:class:`NamedSplit`, optional): Name of the dataset split.
+        axis (``{0, 1}``, default ``0``, meaning over rows):
+            Axis to concatenate over, where ``0`` means over rows (vertically) and ``1`` means over columns
+            (horizontally).
+            *New in version 1.6.0*
+    Example:
+    ```py
+    >>> ds3 = _concatenate_iterable_datasets([ds1, ds2])
+    ```
+    """
+    dsets = [d._resolve_features() for d in dsets]
+
+    # Perform checks (and a potentional cast if axis=0)
+    if axis == 0:
+        _check_if_features_can_be_aligned([dset.features for dset in dsets])
+    else:
+        _check_column_names([col_name for dset in dsets for col_name in dset.features])
+
+    # TODO: improve this to account for a mix of ClassLabel and Value for example
+    # right now it would keep the type of the first dataset in the list
+    features = Features(
+        {k: v for features in _align_features([dset.features for dset in dsets]) for k, v in features.items()}
+    )
+
+    ex_iterables = [d._ex_iterable for d in dsets]
+    if axis == 0:
+        ex_iterable = VerticallyConcatenatedMultiSourcesExamplesIterable(ex_iterables)
+    else:
+        ex_iterable = HorizontallyConcatenatedMultiSourcesExamplesIterable(ex_iterables)
+    # Set new info - we update the features
+    # setting the features also ensures to fill missing columns with None
+    if info is None:
+        info = DatasetInfo.from_merge([d.info for d in dsets])
+    else:
+        info = info.copy()
+    info.features = features
+    # Get all the auth tokens per repository - in case the datasets come from different private repositories
+    token_per_repo_id = {repo_id: token for dataset in dsets for repo_id, token in dataset._token_per_repo_id.items()}
+    # Return new daset
+    return iterable_dataset(ex_iterable=ex_iterable, info=info, split=split, token_per_repo_id=token_per_repo_id)
+def _interleave_iterable_datasets(
+    datasets: List[IterableDataset],
+    probabilities: Optional[List[float]] = None,
+    seed: Optional[int] = None,
+    info: Optional[DatasetInfo] = None,
+    split: Optional[NamedSplit] = None,
+    stopping_strategy: Optional[str] = "first_exhausted",
+) -> IterableDataset:
+    """
+    Interleave several iterable datasets (sources) into a single iterable dataset.
+    The new iterable dataset alternates between the sources to yield examples.
+    If `probabilities = None` (default) the iterable dataset will cycles through the sources in order for each next example in the iteration.
+    If `probabilities` is not `None, the iterable dataset will sample a random source according to the provided probabilities for each next examples in the iteration.
+    <Added version="2.4.0"/>
+    Args:
+        datasets (:obj:`List[IterableDataset]`): list of datasets to interleave
+        probabilities (:obj:`List[float]`, optional, default None): If specified, the new iterable dataset samples
+            examples from one source at a time according to these probabilities.
+        seed (:obj:`int`, optional, default None): The random seed used to choose a source for each example.
+        stopping_strategy (Optional :obj:`str`, defaults to `first_exhausted`):
+            Two strategies are proposed right now.
+            By default, `first_exhausted` is an undersampling strategy, i.e the dataset construction is stopped as soon as one dataset has ran out of samples.
+            If the strategy is `all_exhausted`,  we use an oversampling strategy, i.e the dataset construction is stopped as soon as every samples of every dataset has been added at least once.
+            Note that if the strategy is `all_exhausted`, the interleaved dataset size can get enormous:
+            - with no probabilities, the resulting dataset will have max_length_datasets*nb_dataset samples.
+            - with given probabilities, the resulting dataset will have more samples if some datasets have really low probability of visiting.
+    Output:
+        :class:`datasets.IterableDataset`
+    """
+    datasets = [d._resolve_features() for d in datasets]
+
+    # Perform checks
+    _check_if_features_can_be_aligned([dset.features for dset in datasets])
+
+    # TODO: improve this to account for a mix of ClassLabel and Value for example
+    # right now it would keep the type of the first dataset in the list
+    features = Features(
+        {k: v for features in _align_features([dset.features for dset in datasets]) for k, v in features.items()}
+    )
+
+    ex_iterables = [d._ex_iterable for d in datasets]
+
+    # Use cycling or random cycling or sources
+    if probabilities is None:
+        ex_iterable = CyclingMultiSourcesExamplesIterable(ex_iterables, stopping_strategy=stopping_strategy)
+    else:
+        generator = np.random.default_rng(seed)
+        ex_iterable = RandomlyCyclingMultiSourcesExamplesIterable(
+            ex_iterables, generator=generator, probabilities=probabilities, stopping_strategy=stopping_strategy
+        )
+    # Set new info - we update the features
+    # setting the features also ensures to fill missing columns with None
+    if info is None:
+        info = DatasetInfo.from_merge([d.info for d in datasets])
+    else:
+        info = info.copy()
+    info.features = features
+    # Get all the auth tokens per repository - in case the datasets come from different private repositories
+    token_per_repo_id = {
+        repo_id: token for dataset in datasets for repo_id, token in dataset._token_per_repo_id.items()
+    }
+    # Return new daset
+    return iterable_dataset(ex_iterable=ex_iterable, info=info, split=split, token_per_repo_id=token_per_repo_id)
 
 def iterable_dataset(
     ex_iterable: Iterable,
